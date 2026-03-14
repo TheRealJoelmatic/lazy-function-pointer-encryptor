@@ -29,8 +29,6 @@ The library is a single header file. Copy `EFP.hpp` into your project and includ
 #include "EFP.hpp"
 ```
 
-No build step, no dependencies beyond the Windows SDK and the C++ standard library.
-
 ---
 
 ## Usage
