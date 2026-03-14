@@ -21,36 +21,41 @@ private:
     using FuncType = Ret(*)(Args...);
 
     std::vector<uint8_t> encryptedData;
-    FuncType decryptedFunction;
-    FuncType stubFunction;
+    FuncType decryptedFunction = nullptr;
+    FuncType stubFunction = nullptr;
 
     size_t size;
-    unsigned int key;
+    uint64_t key;
+    bool stubBuilt = false;
 
     void generateKey() {
         std::random_device rd;
         std::mt19937 gen(rd());
-        std::uniform_int_distribution<unsigned int> dis(1, 255);
+        std::uniform_int_distribution<uint64_t> dis(1, 0xFFFFFFFFFFFFFFFF);
         key = dis(gen);
     }
 
     void buildStub()
     {
+        if (stubBuilt)
+            return;
+
         uintptr_t enc = reinterpret_cast<uintptr_t>(decryptedFunction) ^ key;
 
         unsigned char code[] =
         {
             0x48,0xB8,                          // mov rax, imm64
-            0,0,0,0,0,0,0,0,                    // encrypted address
+            0,0,0,0,0,0,0,0,                    // encrypted pointer
 
-            0x48,0x35,                          // xor rax, imm32
-            0,0,0,0,                            // key
+            0x48,0xBA,                          // mov rdx, imm64
+            0,0,0,0,0,0,0,0,                    // key
 
+            0x48,0x31,0xD0,                     // xor rax, rdx
             0xFF,0xE0                           // jmp rax
         };
 
         memcpy(&code[2], &enc, 8);
-        memcpy(&code[12], &key, 4);
+        memcpy(&code[12], &key, 8);
 
         void* mem = VirtualAlloc(
             nullptr,
@@ -62,8 +67,8 @@ private:
         memcpy(mem, code, sizeof(code));
 
         stubFunction = reinterpret_cast<FuncType>(mem);
+        stubBuilt = true;
     }
-
 
 public:
 
@@ -79,10 +84,16 @@ public:
         encrypt();
     }
 
+    ~EncryptedFunction()
+    {
+        if (stubFunction)
+            VirtualFree((void*)stubFunction, 0, MEM_RELEASE);
+    }
+
     void encrypt() override
     {
         for (auto& byte : encryptedData)
-            byte ^= key;
+            byte ^= (uint8_t)key;
 
         decryptedFunction = nullptr;
     }
@@ -92,7 +103,7 @@ public:
         std::memcpy(&decryptedFunction, encryptedData.data(), size);
 
         for (size_t i = 0; i < size; ++i)
-            ((uint8_t*)&decryptedFunction)[i] ^= key;
+            ((uint8_t*)&decryptedFunction)[i] ^= (uint8_t)key;
 
         buildStub();
     }
