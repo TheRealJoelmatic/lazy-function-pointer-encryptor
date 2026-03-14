@@ -6,15 +6,15 @@ A lightweight, header-only C++ library for encrypting function pointers and decr
 
 ## Overview
 
-`lazy-function-pointer-encryptor` wraps any function pointer in an encrypted container. The pointer is XOR-encrypted with a randomly generated key at construction time and is only decrypted immediately before a call is made. After the call completes the pointer is re-encrypted, so the plaintext address is never resident in memory for longer than necessary.
+`lazy-function-pointer-encryptor` wraps any function pointer in an encrypted container. The pointer is XOR-encrypted with a randomly generated 64-bit key at construction time and is only decrypted immediately before a call is made. After the call completes the pointer is re-encrypted, so the plaintext address is never resident in memory for longer than necessary.
 
-The decryption and dispatch is handled through a small x64 assembly stub allocated in executable memory. The stub XORs the encrypted address with the key at call time and jumps to the result, meaning the real function address is never written in plaintext to a fixed memory location.
+The decryption and dispatch is handled through a small x64 assembly stub allocated in executable memory. The stub loads the encrypted address and the full 64-bit key into registers, XORs them together, and jumps to the result. The stub is built once and reused across calls, and the allocated memory is freed when the `EncryptedFunction` object is destroyed.
 
 ---
 
 ## Requirements
 
-- Windows (uses `VirtualAlloc` and `PAGE_EXECUTE_READWRITE`)
+- Windows (uses `VirtualAlloc` / `VirtualFree` and `PAGE_EXECUTE_READWRITE`)
 - 64-bit target architecture (x86-64)
 - C++17 or later (`if constexpr` is required)
 
@@ -78,21 +78,24 @@ EncryptedFunction<ReturnType, Arg1Type, Arg2Type, ...>
 
 ## How it works
 
-1. **Construction** - The constructor stores the raw function pointer bytes, generates a random single-byte XOR key (1-255), and immediately XOR-encrypts the stored bytes. The plaintext pointer is discarded.
+1. **Construction** - The constructor stores the raw function pointer bytes, generates a random 64-bit XOR key (1 through 0xFFFFFFFFFFFFFFFF, inclusive), and immediately XOR-encrypts the stored bytes using the low byte of the key. The plaintext pointer is discarded.
 
 2. **Call** - When `operator()` is invoked, `decrypt()` XOR-decrypts the stored bytes back into a temporary `FuncType` value and calls `buildStub()`.
 
-3. **Stub generation** - `buildStub()` allocates a small region of executable memory via `VirtualAlloc` and writes a minimal x64 sequence into it:
+3. **Stub generation** - `buildStub()` runs only once per instance. It allocates a small region of executable memory via `VirtualAlloc` and writes a 23-byte x64 sequence into it:
    ```
-   mov rax, <encrypted_address>
-   xor rax, <key>
-   jmp rax
+   mov rax, <encrypted_pointer>   ; load encrypted address into rax
+   mov rdx, <key>                 ; load full 64-bit key into rdx
+   xor rax, rdx                   ; recover the real address
+   jmp rax                        ; jump to it
    ```
-   The encrypted address and key are embedded directly in the instruction stream so the final target is only computed at the moment of execution.
+   Both the encrypted pointer and the full 64-bit key are embedded directly in the instruction stream. The real target address is only materialized inside the CPU at the moment of execution.
 
 4. **Dispatch** - The stub is called with the original arguments. For non-void return types the result is saved before continuing.
 
-5. **Re-encryption** - After the call returns, `encrypt()` XORs the stored bytes again with the same key, leaving no plaintext pointer in memory.
+5. **Re-encryption** - After the call returns, `encrypt()` XORs the stored bytes again, leaving no plaintext pointer in memory.
+
+6. **Destruction** - The destructor calls `VirtualFree` to release the stub's executable memory.
 
 ---
 
@@ -106,7 +109,15 @@ EncryptedFunction<ReturnType, Arg1Type, Arg2Type, ...>
 EncryptedFunction(Ret(*func)(Args...))
 ```
 
-Stores and immediately encrypts `func`. A new random key is generated for each instance.
+Stores and immediately encrypts `func`. A new random 64-bit key is generated for each instance. The executable stub is not built until the first call.
+
+**Destructor**
+
+```cpp
+~EncryptedFunction()
+```
+
+Frees the executable stub memory allocated by `VirtualAlloc`.
 
 **Call operator**
 
@@ -114,23 +125,24 @@ Stores and immediately encrypts `func`. A new random key is generated for each i
 Ret operator()(Args... args)
 ```
 
-Decrypts the pointer, calls the function through the generated stub, re-encrypts, and returns the result. Transparent drop-in replacement for a direct function call.
+Decrypts the pointer, calls the function through the generated stub, re-encrypts, and returns the result. Transparent drop-in replacement for a direct function call. The stub is built on the first call and reused on subsequent calls.
 
 **`void encrypt()`**
 
-XOR-encrypts the stored pointer bytes using the instance key and sets the internal decrypted pointer to `nullptr`.
+XOR-encrypts the stored pointer bytes using the low byte of the instance key and sets the internal decrypted pointer to `nullptr`.
 
 **`void decrypt()`**
 
-XOR-decrypts the stored pointer bytes into a temporary value and builds the executable call stub.
+XOR-decrypts the stored pointer bytes into a temporary value and builds the executable call stub if it has not been built yet.
 
 ---
 
 ## Notes
 
 - XOR encryption is intended for obfuscation only. It is not a cryptographically secure scheme.
+- The in-memory storage (`encryptedData`) is encrypted byte-by-byte using only the low byte of the 64-bit key. This provides a simple layer of obfuscation against memory dumps. The stub uses the full 64-bit key for its inline `xor rax, rdx` so that a static view of the stub's instruction stream does not directly reveal the real target address.
 - The encryption key is stored alongside the encrypted data in the same object. A determined analyst with access to process memory can reconstruct the original pointer.
-- **Memory leak**: Each call to `operator()` allocates a new executable stub via `VirtualAlloc`. This memory is never freed. In long-running processes or tight loops this will continuously consume virtual address space. Do not use in performance-critical or long-running code paths without accounting for this.
+- The executable stub is built once and reused across all calls. Stub memory is freed in the destructor, so there is no leak as long as the `EncryptedFunction` object is properly destroyed.
 - **Security note**: Executable stubs are allocated with `PAGE_EXECUTE_READWRITE`, meaning the same memory region is simultaneously writable and executable. This is a known security risk and can make the process more susceptible to code-injection attacks. Be aware of this trade-off when deciding whether this library is appropriate for your threat model.
 - The assembly stub is hardcoded for the x86-64 calling convention and will not work on 32-bit targets.
 
